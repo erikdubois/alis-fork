@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034,SC2001,SC2155,SC2153,SC2143
+# SC2034: foo appears unused. Verify it or export it.
+# SC2001: See if you can use ${variable//search/replace} instead.
+# SC2155 Declare and assign separately to avoid masking return values
+# SC2153: Possible Misspelling: MYVARIABLE may not be assigned. Did you mean MY_VARIABLE?
+# SC2143: Use grep -q instead of comparing output with [ -n .. ].
+
 set -eu
 
 # Arch Linux Install Script (alis) installs unattended, automated
@@ -63,7 +70,7 @@ function check_variables_list() {
     local REQUIRED="$4"
     local SINGLE="$5"
 
-    if [ "$REQUIRED" == "" -o "$REQUIRED" == "true" ]; then
+    if [ "$REQUIRED" == "" ] || [ "$REQUIRED" == "true" ]; then
         check_variables_value "$NAME" "$VALUE"
     fi
 
@@ -72,7 +79,7 @@ function check_variables_list() {
         exit 1
     fi
 
-    if [ "$VALUE" != "" -a -z "$(echo "$VALUES" | grep -F -w "$VALUE")" ]; then
+    if [ "$VALUE" != "" ] && [ -z "$(echo "$VALUES" | grep -F -w "$VALUE")" ]; then #SC2143
         echo "$NAME environment variable value [$VALUE] must be in [$VALUES]."
         exit 1
     fi
@@ -101,14 +108,13 @@ function check_variables_size() {
 
 function configure_network() {
     if [ -n "$WIFI_INTERFACE" ]; then
-        iwctl --passphrase "$WIFI_KEY" station $WIFI_INTERFACE connect "$WIFI_ESSID"
+        iwctl --passphrase "$WIFI_KEY" station "$WIFI_INTERFACE" connect "$WIFI_ESSID"
         sleep 10
     fi
 
     # only one ping -c 1, ping gets stuck if -c 5
-    ping -c 1 -i 2 -W 5 -w 30 $PING_HOSTNAME
-    if [ $? -ne 0 ]; then
-        echo "Network ping check failed. Cannot continue."
+    if ! ping -c 1 -i 2 -W 5 -w 30 "$PING_HOSTNAME"; then
+        echo "Network ping check failed. Can not continue."
         exit 1
     fi
 }
@@ -120,34 +126,51 @@ function facts_commons() {
         BIOS_TYPE="bios"
     fi
 
-    if [ -f "$ALIS_ASCIINEMA_FILE" -o -f "$RECOVERY_ASCIINEMA_FILE" ]; then
+    if [ -f "$ALIS_ASCIINEMA_FILE" ] || [ -f "$RECOVERY_ASCIINEMA_FILE" ]; then
         ASCIINEMA="true"
     else
         ASCIINEMA="false"
     fi
 
-    if [ -n "$(lscpu | grep GenuineIntel)" ]; then
+    if lscpu | grep -q "GenuineIntel"; then
         CPU_VENDOR="intel"
-    elif [ -n "$(lscpu | grep AuthenticAMD)" ]; then
+    elif lscpu | grep -q "AuthenticAMD"; then
         CPU_VENDOR="amd"
+    else
+        CPU_VENDOR=""
     fi
 
-    if [ -n "$(lspci -nn | grep "\[03" | grep -i intel)" ]; then
+    if lspci -nn | grep "\[03" | grep -qi "intel"; then
         GPU_VENDOR="intel"
-    elif [ -n "$(lspci -nn | grep "\[03" | grep -i amd)" ]; then
+    elif lspci -nn | grep "\[03" | grep -qi "amd"; then
         GPU_VENDOR="amd"
-    elif [ -n "$(lspci -nn | grep "\[03" | grep -i nvidia)" ]; then
+    elif lspci -nn | grep "\[03" | grep -qi "nvidia"; then
         GPU_VENDOR="nvidia"
-    elif [ -n "$(lspci -nn | grep "\[03" | grep -i vmware)" ]; then
+    elif lspci -nn | grep "\[03" | grep -qi "vmware"; then
         GPU_VENDOR="vmware"
+    else
+        GPU_VENDOR=""
     fi
 
-    if [ -n "$(systemd-detect-virt | grep -i oracle)" ]; then
+    if systemd-detect-virt | grep -qi "oracle"; then
         VIRTUALBOX="true"
+    else
+        VIRTUALBOX="false"
     fi
 
-    if [ -n "$(systemd-detect-virt | grep -i vmware)" ]; then
+    if systemd-detect-virt | grep -qi "vmware"; then
         VMWARE="true"
+    else
+        VMWARE="false"
+    fi
+
+    INITRD_MICROCODE=""
+    if [ "$VIRTUALBOX" != "true" ] && [ "$VMWARE" != "true" ]; then
+        if [ "$CPU_VENDOR" == "intel" ]; then
+            INITRD_MICROCODE="intel-ucode.img"
+        elif [ "$CPU_VENDOR" == "amd" ]; then
+            INITRD_MICROCODE="amd-ucode.img"
+        fi
     fi
 
     USER_NAME_INSTALL="$(whoami)"
@@ -158,20 +181,26 @@ function facts_commons() {
     fi
 }
 
-function init_log() {
+function init_log_trace() {
+    local ENABLE="$1"
+    if [ "$ENABLE" == "true" ]; then
+        set -o xtrace
+    fi
+}
+
+function init_log_file() {
     local ENABLE="$1"
     local FILE="$2"
     if [ "$ENABLE" == "true" ]; then
-        exec > >(tee -a $FILE)
-        exec 2> >(tee -a $FILE >&2)
+        exec &> >(tee -a "$FILE")
     fi
-    set -o xtrace
 }
 
 function pacman_uninstall() {
     local ERROR="true"
+    local PACKAGES=()
     set +e
-    IFS=' ' local PACKAGES=($1)
+    IFS=' ' read -ra PACKAGES <<< "$1"
     local PACKAGES_UNINSTALL=()
     for PACKAGE in "${PACKAGES[@]}"
     do
@@ -181,12 +210,11 @@ function pacman_uninstall() {
             local PACKAGES_UNINSTALL+=("$PACKAGE")
         fi
     done
-    if [ -z "${PACKAGES_UNINSTALL[@]}" ]; then
+    if [ -z "${PACKAGES_UNINSTALL[*]}" ]; then
         return
     fi
-    local COMMAND="pacman -Rdd --noconfirm ${PACKAGES_UNINSTALL[@]}"
-    execute_sudo "$COMMAND"
-    if [ $? == 0 ]; then
+    local COMMAND="pacman -Rdd --noconfirm ${PACKAGES_UNINSTALL[*]}"
+    if execute_sudo "$COMMAND"; then
         local ERROR="false"
     fi
     set -e
@@ -197,13 +225,13 @@ function pacman_uninstall() {
 
 function pacman_install() {
     local ERROR="true"
+    local PACKAGES=()
     set +e
-    IFS=' ' local PACKAGES=($1)
+    IFS=' ' read -ra PACKAGES <<< "$1"
     for VARIABLE in {1..5}
     do
-        local COMMAND="pacman -Syu --noconfirm --needed ${PACKAGES[@]}"
-        execute_sudo "$COMMAND"
-        if [ $? == 0 ]; then
+        local COMMAND="pacman -Syu --noconfirm --needed ${PACKAGES[*]}"
+       if execute_sudo "$COMMAND"; then
             local ERROR="false"
             break
         else
@@ -218,17 +246,17 @@ function pacman_install() {
 
 function aur_install() {
     local ERROR="true"
+    local PACKAGES=()
     set +e
     which "$AUR_COMMAND"
     if [ "$AUR_COMMAND" != "0" ]; then
         aur_command_install "$USER_NAME" "$AUR_PACKAGE"
     fi
-    IFS=' ' local PACKAGES=($1)
+    IFS=' ' read -ra PACKAGES <<< "$1"
     for VARIABLE in {1..5}
     do
-        local COMMAND="$AUR_COMMAND -Syu --noconfirm --needed ${PACKAGES[@]}"
-        execute_aur "$COMMAND"
-        if [ $? == 0 ]; then
+        local COMMAND="$AUR_COMMAND -Syu --noconfirm --needed ${PACKAGES[*]}"
+        if execute_aur "$COMMAND"; then
             local ERROR="false"
             break
         else
@@ -245,20 +273,21 @@ function aur_command_install() {
     pacman_install "git"
     local USER_NAME="$1"
     local COMMAND="$2"
-    execute_aur "rm -rf /home/$USER_NAME/.alis/aur/$COMMAND && mkdir -p /home/$USER_NAME/.alis/aur && cd /home/$USER_NAME/.alis/aur && git clone https://aur.archlinux.org/$COMMAND.git && (cd $COMMAND && makepkg -si --noconfirm) && rm -rf /home/$USER_NAME/.alis/aur/$COMMAND"
+    execute_aur "rm -rf /home/$USER_NAME/.alis && mkdir -p /home/$USER_NAME/.alis/aur && cd /home/$USER_NAME/.alis/aur && git clone https://aur.archlinux.org/${COMMAND}.git && (cd $COMMAND && makepkg -si --noconfirm) && rm -rf /home/$USER_NAME/.alis"
 }
 
 function systemd_units() {
-    IFS=' ' local UNITS=($SYSTEMD_UNITS)
-    for U in ${UNITS[@]}; do
+    local UNITS=()
+    IFS=' ' read -ra UNITS <<< "$SYSTEMD_UNITS"
+    for U in "${UNITS[@]}"; do
         local ACTION=""
         local UNIT=${U}
         if [[ $UNIT == -* ]]; then
             local ACTION="disable"
-            local UNIT=$(echo $UNIT | sed "s/^-//g")
+            local UNIT=$(echo "$UNIT" | sed "s/^-//g")
         elif [[ $UNIT == +* ]]; then
             local ACTION="enable"
-            local UNIT=$(echo $UNIT | sed "s/^+//g")
+            local UNIT=$(echo "$UNIT" | sed "s/^+//g")
         elif [[ $UNIT =~ ^[a-zA-Z0-9]+ ]]; then
             local ACTION="enable"
             local UNIT=$UNIT
@@ -273,7 +302,7 @@ function systemd_units() {
 function execute_flatpak() {
     local COMMAND="$1"
     if [ "$SYSTEM_INSTALLATION" == "true" ]; then
-        arch-chroot /mnt bash -c "$COMMAND"
+        arch-chroot "${MNT_DIR}" bash -c "$COMMAND"
     else
         bash -c "$COMMAND"
     fi
@@ -282,9 +311,9 @@ function execute_flatpak() {
 function execute_aur() {
     local COMMAND="$1"
     if [ "$SYSTEM_INSTALLATION" == "true" ]; then
-        arch-chroot /mnt sed -i 's/^%wheel ALL=(ALL:ALL) ALL$/%wheel ALL=(ALL:ALL) NOPASSWD: ALL/' /etc/sudoers
-        arch-chroot /mnt bash -c "echo -e \"$USER_PASSWORD\n$USER_PASSWORD\n$USER_PASSWORD\n$USER_PASSWORD\n\" | su $USER_NAME -s /usr/bin/bash -c \"$COMMAND\""
-        arch-chroot /mnt sed -i 's/^%wheel ALL=(ALL:ALL) NOPASSWD: ALL$/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
+        arch-chroot "${MNT_DIR}" sed -i 's/^%wheel ALL=(ALL:ALL) ALL$/%wheel ALL=(ALL:ALL) NOPASSWD: ALL/' /etc/sudoers
+        arch-chroot "${MNT_DIR}" bash -c "echo -e \"$USER_PASSWORD\n$USER_PASSWORD\n$USER_PASSWORD\n$USER_PASSWORD\n\" | su $USER_NAME -s /usr/bin/bash -c \"$COMMAND\""
+        arch-chroot "${MNT_DIR}" sed -i 's/^%wheel ALL=(ALL:ALL) NOPASSWD: ALL$/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
     else
         bash -c "$COMMAND"
     fi
@@ -293,7 +322,7 @@ function execute_aur() {
 function execute_sudo() {
     local COMMAND="$1"
     if [ "$SYSTEM_INSTALLATION" == "true" ]; then
-        arch-chroot /mnt bash -c "$COMMAND"
+        arch-chroot "${MNT_DIR}" bash -c "$COMMAND"
     else
         sudo bash -c "$COMMAND"
     fi
@@ -303,15 +332,15 @@ function execute_user() {
     local USER_NAME="$1"
     local COMMAND="$2"
     if [ "$SYSTEM_INSTALLATION" == "true" ]; then
-        arch-chroot /mnt bash -c "su $USER_NAME -s /usr/bin/bash -c \"$COMMAND\""
+        arch-chroot "${MNT_DIR}" bash -c "su $USER_NAME -s /usr/bin/bash -c \"$COMMAND\""
     else
         bash -c "$COMMAND"
     fi
 }
 
 function do_reboot() {
-    umount -R /mnt/boot
-    umount -R /mnt
+    umount -R "${MNT_DIR}"/boot
+    umount -R "${MNT_DIR}"
     reboot
 }
 
@@ -334,75 +363,69 @@ function partition_setup() {
         if [ "$PARTITION_PARTED_FILE_SYSTEM_TYPE" == "f2fs" ]; then
             PARTITION_PARTED_FILE_SYSTEM_TYPE=""
         fi
-        PARTITION_PARTED_UEFI="mklabel gpt mkpart ESP fat32 1MiB 512MiB mkpart root $PARTITION_PARTED_FILE_SYSTEM_TYPE 512MiB 100% set 1 esp on"
-        PARTITION_PARTED_BIOS="mklabel msdos mkpart primary ext4 4MiB 512MiB mkpart primary $PARTITION_PARTED_FILE_SYSTEM_TYPE 512MiB 100% set 1 boot on"
-
-        if [ "$BIOS_TYPE" == "uefi" ]; then
-            if [ "$DEVICE_SATA" == "true" ]; then
-                PARTITION_BOOT="${DEVICE}1"
-                PARTITION_ROOT="${DEVICE}2"
-                DEVICE_ROOT="${DEVICE}2"
-            fi
-
-            if [ "$DEVICE_NVME" == "true" ]; then
-                PARTITION_BOOT="${DEVICE}p1"
-                PARTITION_ROOT="${DEVICE}p2"
-                DEVICE_ROOT="${DEVICE}p2"
-            fi
-
-            if [ "$DEVICE_MMC" == "true" ]; then
-                PARTITION_BOOT="${DEVICE}p1"
-                PARTITION_ROOT="${DEVICE}p2"
-                DEVICE_ROOT="${DEVICE}p2"
-            fi
-        fi
-
-        if [ "$BIOS_TYPE" == "bios" ]; then
-            if [ "$DEVICE_SATA" == "true" ]; then
-                PARTITION_BOOT="${DEVICE}1"
-                PARTITION_ROOT="${DEVICE}2"
-                DEVICE_ROOT="${DEVICE}2"
-            fi
-
-            if [ "$DEVICE_NVME" == "true" ]; then
-                PARTITION_BOOT="${DEVICE}p1"
-                PARTITION_ROOT="${DEVICE}p2"
-                DEVICE_ROOT="${DEVICE}p2"
-            fi
-
-            if [ "$DEVICE_MMC" == "true" ]; then
-                PARTITION_BOOT="${DEVICE}p1"
-                PARTITION_ROOT="${DEVICE}p2"
-                DEVICE_ROOT="${DEVICE}p2"
-            fi
-        fi
+        PARTITION_PARTED_UEFI="mklabel gpt mkpart ESP fat32 1MiB 1024MiB mkpart root $PARTITION_PARTED_FILE_SYSTEM_TYPE 1024MiB 100% set 1 esp on"
+        PARTITION_PARTED_BIOS="mklabel msdos mkpart primary ext4 4MiB 1024MiB mkpart primary $PARTITION_PARTED_FILE_SYSTEM_TYPE 1024MiB 100% set 1 boot on"
     elif [ "$PARTITION_MODE" == "custom" ]; then
         PARTITION_PARTED_UEFI="$PARTITION_CUSTOM_PARTED_UEFI"
         PARTITION_PARTED_BIOS="$PARTITION_CUSTOM_PARTED_BIOS"
     fi
 
-    if [ "$PARTITION_MODE" == "custom" -o "$PARTITION_MODE" == "manual" ]; then
-        PARTITION_BOOT="$PARTITION_CUSTOMMANUAL_BOOT"
-        PARTITION_ROOT="$PARTITION_CUSTOMMANUAL_ROOT"
-        DEVICE_ROOT="${PARTITION_ROOT}"
+    if [ "$DEVICE_SDA" == "true" ]; then
+        PARTITION_BOOT="$(partition_device "${DEVICE}" "${PARTITION_BOOT_NUMBER}")"
+        PARTITION_ROOT="$(partition_device "${DEVICE}" "${PARTITION_ROOT_NUMBER}")"
+        DEVICE_ROOT="$(partition_device "${DEVICE}" "${PARTITION_ROOT_NUMBER}")"
     fi
 
-    PARTITION_BOOT_NUMBER="$PARTITION_BOOT"
-    PARTITION_ROOT_NUMBER="$PARTITION_ROOT"
-    PARTITION_BOOT_NUMBER="${PARTITION_BOOT_NUMBER//\/dev\/sda/}"
-    PARTITION_BOOT_NUMBER="${PARTITION_BOOT_NUMBER//\/dev\/nvme0n1p/}"
-    PARTITION_BOOT_NUMBER="${PARTITION_BOOT_NUMBER//\/dev\/vda/}"
-    PARTITION_BOOT_NUMBER="${PARTITION_BOOT_NUMBER//\/dev\/mmcblk0p/}"
-    PARTITION_ROOT_NUMBER="${PARTITION_ROOT_NUMBER//\/dev\/sda/}"
-    PARTITION_ROOT_NUMBER="${PARTITION_ROOT_NUMBER//\/dev\/nvme0n1p/}"
-    PARTITION_ROOT_NUMBER="${PARTITION_ROOT_NUMBER//\/dev\/vda/}"
-    PARTITION_ROOT_NUMBER="${PARTITION_ROOT_NUMBER//\/dev\/mmcblk0p/}"
+    if [ "$DEVICE_NVME" == "true" ]; then
+        PARTITION_BOOT="$(partition_device "${DEVICE}" "${PARTITION_BOOT_NUMBER}")"
+        PARTITION_ROOT="$(partition_device "${DEVICE}" "${PARTITION_ROOT_NUMBER}")"
+        DEVICE_ROOT="$(partition_device "${DEVICE}" "${PARTITION_ROOT_NUMBER}")"
+    fi
+
+    if [ "$DEVICE_VDA" == "true" ]; then
+        PARTITION_BOOT="$(partition_device "${DEVICE}" "${PARTITION_BOOT_NUMBER}")"
+        PARTITION_ROOT="$(partition_device "${DEVICE}" "${PARTITION_ROOT_NUMBER}")"
+        DEVICE_ROOT="$(partition_device "${DEVICE}" "${PARTITION_ROOT_NUMBER}")"
+    fi
+
+    if [ "$DEVICE_MMC" == "true" ]; then
+        PARTITION_BOOT="$(partition_device "${DEVICE}" "${PARTITION_BOOT_NUMBER}")"
+        PARTITION_ROOT="$(partition_device "${DEVICE}" "${PARTITION_ROOT_NUMBER}")"
+        DEVICE_ROOT="$(partition_device "${DEVICE}" "${PARTITION_ROOT_NUMBER}")"
+    fi
+}
+
+function partition_device() {
+    local DEVICE="$1"
+    local NUMBER="$2"
+    local PARTITION_DEVICE=""
+
+    if [ "$DEVICE_SDA" == "true" ]; then
+        PARTITION_DEVICE="${DEVICE}${NUMBER}"
+    fi
+
+    if [ "$DEVICE_NVME" == "true" ]; then
+        PARTITION_DEVICE="${DEVICE}p${NUMBER}"
+    fi
+
+    if [ "$DEVICE_VDA" == "true" ]; then
+        PARTITION_DEVICE="${DEVICE}${NUMBER}"
+    fi
+
+    if [ "$DEVICE_MMC" == "true" ]; then
+        PARTITION_DEVICE="${DEVICE}p${NUMBER}"
+    fi
+
+    echo "$PARTITION_DEVICE"
 }
 
 function partition_options() {
     PARTITION_OPTIONS_BOOT="defaults"
     PARTITION_OPTIONS="defaults"
 
+    if [ "$BIOS_TYPE" == "uefi" ]; then
+        PARTITION_OPTIONS_BOOT="$PARTITION_OPTIONS_BOOT,uid=0,gid=0,fmask=0177,dmask=0077"
+    fi
     if [ "$DEVICE_TRIM" == "true" ]; then
         PARTITION_OPTIONS_BOOT="$PARTITION_OPTIONS_BOOT,noatime"
         PARTITION_OPTIONS="$PARTITION_OPTIONS,noatime"
@@ -415,28 +438,61 @@ function partition_options() {
 function partition_mount() {
     if [ "$FILE_SYSTEM_TYPE" == "btrfs" ]; then
         # mount subvolumes
-        mount -o "subvol=${BTRFS_SUBVOLUME_ROOT[1]},$PARTITION_OPTIONS,compress=zstd" "$DEVICE_ROOT" /mnt
-        mkdir -p /mnt/boot
-        mount -o "$PARTITION_OPTIONS_BOOT" "$PARTITION_BOOT" /mnt/boot
+        mount -o "subvol=${BTRFS_SUBVOLUME_ROOT[1]},$PARTITION_OPTIONS,compress=zstd" "$DEVICE_ROOT" "${MNT_DIR}"
+        mkdir -p "${MNT_DIR}"/boot
+        mount -o "$PARTITION_OPTIONS_BOOT" "$PARTITION_BOOT" "${MNT_DIR}"/boot
         for I in "${BTRFS_SUBVOLUMES_MOUNTPOINTS[@]}"; do
-            IFS=',' SUBVOLUME=($I)
-            if [ ${SUBVOLUME[0]} == "root" ]; then
+            IFS=',' read -ra SUBVOLUME <<< "$I"
+            if [ "${SUBVOLUME[0]}" == "root" ]; then
                 continue
             fi
-            if [ ${SUBVOLUME[0]} == "swap" -a -z "$SWAP_SIZE" ]; then
+            if [ "${SUBVOLUME[0]}" == "swap" ] && [ -z "$SWAP_SIZE" ]; then
                 continue
             fi
-            if [ ${SUBVOLUME[0]} == "swap" ]; then
-                mkdir -p -m 0755 "/mnt${SUBVOLUME[2]}"
+            if [ "${SUBVOLUME[0]}" == "swap" ]; then
+                mkdir -p "${MNT_DIR}${SUBVOLUME[2]}"
+                chmod 0755 "${MNT_DIR}${SUBVOLUME[2]}"
             else
-                mkdir -p "/mnt${SUBVOLUME[2]}"
+                mkdir -p "${MNT_DIR}${SUBVOLUME[2]}"
             fi
-            mount -o "subvol=${SUBVOLUME[1]},$PARTITION_OPTIONS,compress=zstd" "$DEVICE_ROOT" "/mnt${SUBVOLUME[2]}"
+            mount -o "subvol=${SUBVOLUME[1]},$PARTITION_OPTIONS,compress=zstd" "$DEVICE_ROOT" "${MNT_DIR}${SUBVOLUME[2]}"
         done
     else
-        mount -o "$PARTITION_OPTIONS" "$DEVICE_ROOT" /mnt
+        # root
+        mount -o "$PARTITION_OPTIONS" "$DEVICE_ROOT" "${MNT_DIR}"
 
-        mkdir -p /mnt/boot
-        mount -o "$PARTITION_OPTIONS_BOOT" "$PARTITION_BOOT" /mnt/boot
+        # boot
+        mkdir -p "${MNT_DIR}"/boot
+        mount -o "$PARTITION_OPTIONS_BOOT" "$PARTITION_BOOT" "${MNT_DIR}"/boot
+
+        # mount points
+        for I in "${PARTITION_MOUNT_POINTS[@]}"; do
+            if [[ "$I" =~ ^!.* ]]; then
+                continue
+            fi
+            IFS='=' read -ra PARTITION_MOUNT_POINT <<< "$I"
+            if [ "${PARTITION_MOUNT_POINT[1]}" == "/boot" ] || [ "${PARTITION_MOUNT_POINT[1]}" == "/" ]; then
+                continue
+            fi
+            local PARTITION_DEVICE="$(partition_device "${DEVICE}" "${PARTITION_MOUNT_POINT[0]}")"
+            mkdir -p "${MNT_DIR}${PARTITION_MOUNT_POINT[1]}"
+            mount -o "$PARTITION_OPTIONS" "${PARTITION_DEVICE}" "${MNT_DIR}${PARTITION_MOUNT_POINT[1]}"
+        done
+    fi
+}
+
+function ask_password() {
+    PASSWORD_NAME="$1"
+    PASSWORD_VARIABLE="$2"
+    read -r -sp "Type ${PASSWORD_NAME} password: " PASSWORD1
+    echo ""
+    read -r -sp "Retype ${PASSWORD_NAME} password: " PASSWORD2
+    echo ""
+    if [[ "$PASSWORD1" == "$PASSWORD2" ]]; then
+        declare -n VARIABLE="${PASSWORD_VARIABLE}"
+        VARIABLE="$PASSWORD1"
+    else
+        echo "${PASSWORD_NAME} password don't match. Please, type again."
+        ask_password "${PASSWORD_NAME}" "${PASSWORD_VARIABLE}"
     fi
 }
